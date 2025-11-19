@@ -10,9 +10,12 @@
   "keywords": [],
   "author": "",
   "license": "GPL-2.0",
-  "description": "RepoPush - Syncs local git repositories to GitHub using fine-grained tokens",
+  "description": "RepoPush - Auto-commits file changes and syncs local git repositories to GitHub using fine-grained tokens",
   "dependencies": {
-    "dotenv": "^16.3.1"
+    "axios": "^1.12.2",
+    "chokidar": "^4.0.3",
+    "dotenv": "^16.3.1",
+    "ignore": "^5.3.0"
   }
 }
 

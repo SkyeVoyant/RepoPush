@@ -5,15 +5,21 @@ const path = require('path');
 const { execFile } = require('child_process');
 const util = require('util');
 const os = require('os');
+const axios = require('axios');
+const chokidar = require('chokidar');
+const ignore = require('ignore');
 
 const execFileAsync = util.promisify(execFile);
 
-// Parse .env file (reads fresh every time)
+// Parse .env file (reads fresh every time for push config)
 function parseEnvFile(envPath) {
   const content = fs.readFileSync(envPath, 'utf8');
   const config = {
     token: null,
+    gitAuthorName: null,
+    gitAuthorEmail: null,
     syncTime: 60, // default 60 minutes
+    commitDebounceMs: 3000, // default 3 seconds debounce for commits
     projects: []
   };
 
@@ -37,8 +43,14 @@ function parseEnvFile(envPath) {
 
     if (key === 'token') {
       config.token = value;
+    } else if (key === 'git_author_name') {
+      config.gitAuthorName = value;
+    } else if (key === 'git_author_email') {
+      config.gitAuthorEmail = value;
     } else if (key === 'sync_time') {
       config.syncTime = parseInt(value, 10) || 60;
+    } else if (key === 'commit_debounce_ms') {
+      config.commitDebounceMs = parseInt(value, 10) || 3000;
     } else if (key === 'gitlink') {
       if (currentProject) {
         // Finish previous project if it has both fields
@@ -67,30 +79,17 @@ function getEnvPath() {
   return process.env.ENV_FILE || path.join(__dirname, '.env');
 }
 
-// Create askpass script for git authentication
-function createAskPassScript(token) {
-  const scriptPath = path.join(os.tmpdir(), `github-askpass-${Date.now()}.sh`);
-  const script = `#!/bin/sh
-case "$1" in
-  *Username*) echo "x-access-token" ;;
-  *) echo "${token}" ;;
-esac
-`;
-  fs.writeFileSync(scriptPath, script, { mode: 0o700 });
-  return scriptPath;
-}
-
 // Execute git command with timeout
 async function git(projectPath, args, options = {}) {
   const timeout = options.timeout || 300000; // 5 minutes default timeout
   const timeoutMs = timeout;
-  delete options.timeout; // Remove timeout from options before passing to execFile
+  delete options.timeout;
   
   return new Promise((resolve, reject) => {
     let resolved = false;
     const child = execFile('git', args, {
       cwd: projectPath,
-      maxBuffer: 50 * 1024 * 1024, // 50MB buffer for large repos
+      maxBuffer: 50 * 1024 * 1024, // 50MB buffer
       ...options
     }, (error, stdout, stderr) => {
       if (resolved) return;
@@ -106,18 +105,37 @@ async function git(projectPath, args, options = {}) {
       }
     });
 
-    // Set timeout - kill more aggressively
     const timeoutId = setTimeout(() => {
       if (resolved) return;
       resolved = true;
       try {
-        child.kill('SIGKILL'); // Use SIGKILL for immediate termination
+        child.kill('SIGKILL');
       } catch (e) {
         // Ignore
       }
       reject(new Error(`Git command timed out after ${timeoutMs}ms: git ${args.join(' ')}`));
     }, timeoutMs);
   });
+}
+
+// Fetch GitHub user info
+async function fetchGitHubUserInfo(token) {
+  try {
+    const response = await axios.get('https://api.github.com/user', {
+      headers: {
+        'Authorization': `token ${token}`,
+        'Accept': 'application/vnd.github.v3+json'
+      }
+    });
+    return {
+      name: response.data.name || response.data.login,
+      email: response.data.email || `${response.data.id}+${response.data.login}@users.noreply.github.com`,
+      login: response.data.login
+    };
+  } catch (error) {
+    console.error('Failed to fetch GitHub user info:', error.message);
+    return null;
+  }
 }
 
 // Check if directory is a git repository
@@ -140,178 +158,68 @@ async function getCurrentBranch(projectPath) {
   }
 }
 
-// Get all local branches
-async function getAllBranches(projectPath) {
-  try {
-    const { stdout } = await git(projectPath, ['branch', '--list', '--format', '%(refname:short)']);
-    return stdout.split('\n').filter(b => b.trim()).map(b => b.trim());
-  } catch {
-    return [];
-  }
-}
+// Load .gitignore patterns for a project
+function loadGitignorePatterns(projectPath) {
+  const ig = ignore();
+  
+  // Add default ignores
+  ig.add([
+    '.git',
+    '.git/**',
+    'node_modules',
+    'node_modules/**'
+  ]);
 
-// Get all tags
-async function getAllTags(projectPath) {
-  try {
-    const { stdout } = await git(projectPath, ['tag', '--list']);
-    return stdout.split('\n').filter(t => t.trim()).map(t => t.trim());
-  } catch {
-    return [];
-  }
-}
-
-// Check if remote branch exists
-async function remoteBranchExists(projectPath, branch, remote = 'github') {
-  try {
-    await git(projectPath, ['ls-remote', '--heads', remote, branch], {
-      timeout: 15000 // 15 second timeout (shorter for faster checks)
-    });
-    return true;
-  } catch (error) {
-    if (error.message.includes('timed out')) {
-      // Timeout means we can't verify, assume it doesn't exist to trigger sync
-      return false;
-    }
-    return false;
-  }
-}
-
-// Get local commit hash for a branch
-async function getLocalCommitHash(projectPath, branch) {
-  try {
-    const { stdout } = await git(projectPath, ['rev-parse', branch]);
-    return stdout.trim();
-  } catch {
-    return null;
-  }
-}
-
-// Get remote commit hash for a branch
-async function getRemoteCommitHash(projectPath, branch, remote = 'github') {
-  try {
-    const { stdout } = await git(projectPath, ['ls-remote', '--heads', remote, branch], {
-      timeout: 15000 // 15 second timeout (shorter for faster checks)
-    });
-    if (stdout.trim()) {
-      // Format: <hash>	refs/heads/<branch>
-      const match = stdout.trim().match(/^([a-f0-9]+)\s+refs\/heads\//);
-      return match ? match[1] : null;
-    }
-    return null;
-  } catch (error) {
-    if (error.message.includes('timed out')) {
-      // Timeout means we can't verify, return null to trigger sync
-      return null;
-    }
-    return null;
-  }
-}
-
-// Check if branch needs syncing (local is ahead of remote)
-async function branchNeedsSync(projectPath, branch, remote = 'github') {
-  try {
-    const remoteExists = await remoteBranchExists(projectPath, branch, remote);
-    
-    if (!remoteExists) {
-      // Remote doesn't exist, need to push
-      return true;
-    }
-
-    const localHash = await getLocalCommitHash(projectPath, branch);
-    const remoteHash = await getRemoteCommitHash(projectPath, branch, remote);
-
-    if (!localHash) {
-      return false; // Can't determine, skip
-    }
-
-    if (!remoteHash) {
-      return true; // Remote doesn't have this branch, need to push
-    }
-
-    if (localHash === remoteHash) {
-      return false; // Already in sync
-    }
-
-    // Check if local is ahead (has commits not in remote)
+  // Load .gitignore if it exists
+  const gitignorePath = path.join(projectPath, '.gitignore');
+  if (fs.existsSync(gitignorePath)) {
     try {
-      const { stdout } = await git(projectPath, ['rev-list', '--count', `${remoteHash}..${localHash}`], {
-        timeout: 10000
-      });
-      const aheadCount = parseInt(stdout.trim(), 10) || 0;
-      return aheadCount > 0;
-    } catch {
-      // If we can't compare, assume we need to sync (might be diverged)
-      return true;
-    }
-  } catch (error) {
-    // On error, assume we need to sync to be safe
-    console.log(`[${path.basename(projectPath)}] Could not check sync status for ${branch}, will attempt sync: ${error.message}`);
-    return true;
-  }
-}
-
-// Check if tags need syncing
-async function tagsNeedSync(projectPath, remote = 'github') {
-  try {
-    const localTags = await getAllTags(projectPath);
-    if (localTags.length === 0) {
-      return false;
-    }
-
-    // Get remote tags
-    let remoteTags = [];
-    try {
-      const { stdout } = await git(projectPath, ['ls-remote', '--tags', remote], {
-        timeout: 15000 // 15 second timeout
-      });
-      remoteTags = stdout.split('\n')
-        .filter(line => line.trim())
-        .map(line => {
-          const match = line.match(/refs\/tags\/([^\s\^]+)/);
-          return match ? match[1] : null;
-        })
-        .filter(tag => tag !== null);
+      const content = fs.readFileSync(gitignorePath, 'utf8');
+      ig.add(content);
     } catch (error) {
-      // If we can't fetch remote tags (including timeout), assume we need to sync
-      if (error.message.includes('timed out')) {
-        return true; // Timeout - assume we need to sync to be safe
-      }
-      return true;
+      console.error(`Failed to read .gitignore: ${error.message}`);
     }
+  }
 
-    // Check if any local tags are missing on remote
-    for (const localTag of localTags) {
-      if (!remoteTags.includes(localTag)) {
-        return true; // Found a tag that needs syncing
-      }
-    }
+  return ig;
+}
 
-    return false; // All tags are synced
+// Check if path should be ignored
+function shouldIgnorePath(projectPath, filePath, igInstance) {
+  const relative = path.relative(projectPath, filePath);
+  
+  // Ignore if outside project
+  if (!relative || relative.startsWith('..')) {
+    return true;
+  }
+  
+  // Check against ignore patterns
+  return igInstance.ignores(relative);
+}
+
+// Check if there are uncommitted changes
+async function hasUncommittedChanges(projectPath) {
+  try {
+    const { stdout } = await git(projectPath, ['status', '--porcelain']);
+    return stdout.length > 0;
   } catch {
-    return true; // On error, assume we need to sync
+    return false;
   }
 }
 
 // Set remote URL with token
 async function setRemote(projectPath, gitlink, token) {
-  // Convert HTTPS URL to include token
-  // For fine-grained tokens, use x-access-token as username
-  // https://github.com/user/repo -> https://x-access-token:token@github.com/user/repo
   let remoteUrl = gitlink;
   if (remoteUrl.startsWith('https://')) {
-    // Remove existing auth if present
     remoteUrl = remoteUrl.replace(/https:\/\/[^@]+@/, 'https://');
-    // Insert token with x-access-token username
     remoteUrl = remoteUrl.replace('https://', `https://x-access-token:${token}@`);
   } else if (remoteUrl.startsWith('git@')) {
-    // For SSH, convert to HTTPS with token
     remoteUrl = remoteUrl
-      .replace('git@github.com:', 'https://')
+      .replace('git@github.com:', 'https://github.com/')
       .replace('.git', '')
       .replace('https://', `https://x-access-token:${token}@`) + '.git';
   }
 
-  // Check if remote exists
   let remoteExists = false;
   try {
     await git(projectPath, ['remote', 'get-url', 'github']);
@@ -321,195 +229,444 @@ async function setRemote(projectPath, gitlink, token) {
   }
 
   if (remoteExists) {
-    // Update existing remote URL
     await git(projectPath, ['remote', 'set-url', 'github', remoteUrl]);
   } else {
-    // Add new remote
     await git(projectPath, ['remote', 'add', 'github', remoteUrl]);
   }
 }
 
-// Sync a single project
-async function syncProject(project, token) {
-  const { gitlink, gitlocation } = project;
-  const projectName = path.basename(gitlocation);
+// Set git user config
+async function setGitConfig(projectPath, userInfo) {
+  await git(projectPath, ['config', 'user.name', userInfo.name]);
+  await git(projectPath, ['config', 'user.email', userInfo.email]);
+  await git(projectPath, ['config', 'commit.gpgsign', 'false']);
+}
 
-  console.log(`\n[${projectName}] Starting sync...`);
-  console.log(`  Location: ${gitlocation}`);
-  console.log(`  Remote: ${gitlink}`);
-
-  // Check if directory exists
-  if (!fs.existsSync(gitlocation)) {
-    console.error(`[${projectName}] ERROR: Directory does not exist: ${gitlocation}`);
-    return;
-  }
-
-  // Check if it's a git repo
-  const isRepo = await isGitRepo(gitlocation);
-  if (!isRepo) {
-    console.error(`[${projectName}] ERROR: Not a git repository: ${gitlocation}`);
-    return;
-  }
-
+// Commit changes in a project
+async function commitChanges(projectPath, userInfo) {
+  const projectName = path.basename(projectPath);
+  
   try {
-    // Set remote
-    await setRemote(gitlocation, gitlink, token);
-
-    // Get current branch (don't modify local repo structure)
-    const currentBranch = await getCurrentBranch(gitlocation);
-    const targetBranch = 'main'; // Always push to main on GitHub
-    console.log(`[${projectName}] Current local branch: ${currentBranch}`);
-    console.log(`[${projectName}] Syncing to ${targetBranch} on GitHub (no local changes)`);
-
-    // Check if main branch on GitHub needs syncing
-    // We check against the remote main branch, but we'll push from current local branch
-    const needsSync = await branchNeedsSync(gitlocation, targetBranch, 'github');
-    
-    if (!needsSync) {
-      console.log(`[${projectName}] GitHub ${targetBranch} branch is already in sync, skipping`);
-      return;
+    // Check if there are changes
+    const hasChanges = await hasUncommittedChanges(projectPath);
+    if (!hasChanges) {
+      return false;
     }
 
-    // Push current branch to main on GitHub (will create main on GitHub if it doesn't exist)
-    // Format: git push github <local-branch>:main
-    console.log(`[${projectName}] GitHub ${targetBranch} needs sync, pushing ${currentBranch} -> ${targetBranch}...`);
-    try {
-      // Push current branch to main on GitHub with set-upstream (creates main on GitHub if it doesn't exist)
-      await git(gitlocation, ['push', '--set-upstream', 'github', `${currentBranch}:${targetBranch}`, '--force'], {
-        env: { ...process.env, GIT_TERMINAL_PROMPT: '0', GIT_HTTP_LOW_SPEED_LIMIT: '1000', GIT_HTTP_LOW_SPEED_TIME: '30' },
-        timeout: 120000 // 2 minute timeout for push
-      });
-      console.log(`[${projectName}] ✓ Pushed ${currentBranch} -> ${targetBranch} on GitHub`);
-    } catch (error) {
-      // If set-upstream fails, try regular push
-      try {
-        await git(gitlocation, ['push', 'github', `${currentBranch}:${targetBranch}`, '--force'], {
-          env: { ...process.env, GIT_TERMINAL_PROMPT: '0', GIT_HTTP_LOW_SPEED_LIMIT: '1000', GIT_HTTP_LOW_SPEED_TIME: '30' },
-          timeout: 120000
-        });
-        console.log(`[${projectName}] ✓ Pushed ${currentBranch} -> ${targetBranch} on GitHub`);
-      } catch (error2) {
-        // Check if it's a permission error
-        const errorMsg = error2.message.toLowerCase();
-        if (errorMsg.includes('permission') || errorMsg.includes('forbidden') || errorMsg.includes('unauthorized')) {
-          console.error(`[${projectName}] ✗ Permission denied. To create branches, the token needs:`);
-          console.error(`[${projectName}]    - Contents: Read and write (required)`);
-          console.error(`[${projectName}]    - Metadata: Read (may be needed to verify repository access)`);
-          console.error(`[${projectName}]   If it still fails, you may also need:`);
-          console.error(`[${projectName}]    - Administration: Read (if repository settings restrict branch creation)`);
-        }
-        console.error(`[${projectName}] ✗ Failed to push ${currentBranch} -> ${targetBranch}: ${error2.message}`);
-      }
+    // Stage all changes
+    await git(projectPath, ['add', '-A']);
+
+    // Check again after staging
+    const hasChangesAfterStaging = await hasUncommittedChanges(projectPath);
+    if (!hasChangesAfterStaging) {
+      return false;
     }
 
-    // Push tags if needed
-    const tagsNeedPushing = await tagsNeedSync(gitlocation, 'github');
-    if (tagsNeedPushing) {
-      const tags = await getAllTags(gitlocation);
-      if (tags.length > 0) {
-        console.log(`[${projectName}] Found ${tags.length} tag(s) that need syncing`);
-        try {
-          await git(gitlocation, ['push', 'github', '--tags', '--force'], {
-            env: { ...process.env, GIT_TERMINAL_PROMPT: '0' },
-            timeout: 120000
-          });
-          console.log(`[${projectName}] ✓ Pushed all tags`);
-        } catch (error) {
-          console.error(`[${projectName}] ✗ Failed to push tags: ${error.message}`);
-        }
-      }
-    } else {
-      const tags = await getAllTags(gitlocation);
-      if (tags.length > 0) {
-        console.log(`[${projectName}] All tags are already in sync (${tags.length} tag(s))`);
-      }
-    }
+    // Set git config
+    await setGitConfig(projectPath, userInfo);
 
-    console.log(`[${projectName}] Sync complete`);
-
+    // Commit
+    const timestamp = new Date().toISOString();
+    await git(projectPath, ['commit', '-m', `Auto backup ${timestamp}`]);
+    console.log(`[${projectName}] ✓ Committed changes`);
+    return true;
   } catch (error) {
-    console.error(`[${projectName}] ERROR: ${error.message}`);
+    console.error(`[${projectName}] Failed to commit: ${error.message}`);
+    return false;
   }
 }
 
-// Perform full sync of all projects
-async function performSync() {
-  const envPath = getEnvPath();
+// Extract repo owner and name from GitHub URL
+function parseGitHubUrl(gitlink) {
+  // Handle https://github.com/owner/repo or https://github.com/owner/repo.git
+  const match = gitlink.match(/github\.com[\/:]([^\/]+)\/([^\/\.]+)/);
+  if (match) {
+    return { owner: match[1], repo: match[2] };
+  }
+  return null;
+}
+
+// Check if GitHub repo exists and create if it doesn't
+async function ensureGitHubRepo(gitlink, token, userInfo) {
+  const parsed = parseGitHubUrl(gitlink);
+  if (!parsed) {
+    console.error(`Failed to parse GitHub URL: ${gitlink}`);
+    return { exists: false, canRetry: false };
+  }
+
+  const { owner, repo } = parsed;
+
+  try {
+    // Check if repo exists
+    await axios.get(`https://api.github.com/repos/${owner}/${repo}`, {
+      headers: {
+        'Authorization': `token ${token}`,
+        'Accept': 'application/vnd.github.v3+json'
+      }
+    });
+    return { exists: true, canRetry: false }; // Repo exists
+  } catch (error) {
+    if (error.response && error.response.status === 404) {
+      // Repo doesn't exist, try to create it
+      console.log(`[${repo}] Repository doesn't exist, attempting to create...`);
+      
+      try {
+        // Check if we're creating in user's account or an org
+        const isUserRepo = owner === userInfo.login;
+        const endpoint = isUserRepo 
+          ? 'https://api.github.com/user/repos'
+          : `https://api.github.com/orgs/${owner}/repos`;
+
+        await axios.post(endpoint, {
+          name: repo,
+          private: true,
+          auto_init: false,
+          description: `Auto-synced repository managed by RepoPush`
+        }, {
+          headers: {
+            'Authorization': `token ${token}`,
+            'Accept': 'application/vnd.github.v3+json'
+          }
+        });
+        
+        console.log(`[${repo}] ✓ Created private repository on GitHub`);
+        return { exists: true, canRetry: false };
+      } catch (createError) {
+        // Creation failed - could be permissions or other issues
+        const isPermissionError = createError.response && 
+          (createError.response.status === 403 || createError.response.status === 401);
+        
+        if (createError.response) {
+          if (isPermissionError) {
+            // Permission error - provide helpful info but allow retry
+            console.warn(`[${repo}] ⚠ Cannot auto-create repository (missing Administration permission)`);
+            console.warn(`[${repo}]   Option 1: Add 'Administration: Read and write' permission to your token`);
+            console.warn(`[${repo}]   Option 2: Manually create the repository at: https://github.com/${owner}/${repo}`);
+            console.warn(`[${repo}]   Will retry on next sync interval...`);
+          } else {
+            console.error(`[${repo}] ✗ Failed to create repository: ${createError.response.data.message}`);
+          }
+        } else {
+          console.error(`[${repo}] ✗ Failed to create repository: ${createError.message}`);
+        }
+        
+        // Return canRetry=true so we keep trying
+        return { exists: false, canRetry: true };
+      }
+    } else {
+      // Other error checking repo (network, auth, etc)
+      console.error(`[${repo}] Failed to check repository: ${error.message}`);
+      return { exists: false, canRetry: true };
+    }
+  }
+}
+
+// Push changes to GitHub
+async function pushToGitHub(projectPath, gitlink, token, userInfo) {
+  const projectName = path.basename(projectPath);
   
-  if (!fs.existsSync(envPath)) {
-    console.error(`ERROR: .env file not found at ${envPath}`);
-    return;
+  try {
+    // Ensure GitHub repo exists (create if needed)
+    const repoStatus = await ensureGitHubRepo(gitlink, token, userInfo);
+    
+    if (!repoStatus.exists) {
+      if (repoStatus.canRetry) {
+        // Repo doesn't exist but we can retry later (e.g., missing permissions or waiting for manual creation)
+        console.log(`[${projectName}] Skipping push - will retry on next sync interval`);
+      } else {
+        // Something is fundamentally wrong (e.g., invalid URL)
+        console.error(`[${projectName}] Skipping push - repository configuration error`);
+      }
+      return false;
+    }
+
+    // Set remote
+    await setRemote(projectPath, gitlink, token);
+
+    // Get current branch
+    const currentBranch = await getCurrentBranch(projectPath);
+    const targetBranch = 'main';
+
+    // Push to GitHub
+    console.log(`[${projectName}] Pushing ${currentBranch} -> ${targetBranch} on GitHub...`);
+    try {
+      await git(projectPath, ['push', '--set-upstream', 'github', `${currentBranch}:${targetBranch}`, '--force'], {
+        env: { ...process.env, GIT_TERMINAL_PROMPT: '0' },
+        timeout: 120000
+      });
+      console.log(`[${projectName}] ✓ Pushed to GitHub`);
+    } catch (error) {
+      // Try without set-upstream
+      await git(projectPath, ['push', 'github', `${currentBranch}:${targetBranch}`, '--force'], {
+        env: { ...process.env, GIT_TERMINAL_PROMPT: '0' },
+        timeout: 120000
+      });
+      console.log(`[${projectName}] ✓ Pushed to GitHub`);
+    }
+
+    // Push tags
+    try {
+      await git(projectPath, ['push', 'github', '--tags', '--force'], {
+        env: { ...process.env, GIT_TERMINAL_PROMPT: '0' },
+        timeout: 120000
+      });
+    } catch (error) {
+      // Tags push failure is not critical
+    }
+
+    return true;
+  } catch (error) {
+    console.error(`[${projectName}] Failed to push: ${error.message}`);
+    return false;
+  }
+}
+
+// Project state manager
+class ProjectManager {
+  constructor(token, userInfo) {
+    this.token = token;
+    this.userInfo = userInfo;
+    this.projects = new Map(); // path -> { gitlink, watcher, commitTimeout, ignoreInstance }
+    this.commitDebounceMs = 3000;
   }
 
-  console.log(`\n${'='.repeat(60)}`);
-  console.log(`Reading configuration from: ${envPath}`);
-  console.log(`${'='.repeat(60)}`);
+  async addProject(gitlink, gitlocation) {
+    const projectName = path.basename(gitlocation);
 
-  // Read .env file fresh
-  const config = parseEnvFile(envPath);
+    // Check if directory exists
+    if (!fs.existsSync(gitlocation)) {
+      console.error(`[${projectName}] ERROR: Directory does not exist: ${gitlocation}`);
+      return;
+    }
 
-  if (!config.token) {
-    console.error('ERROR: GitHub token not found in .env file');
-    return;
+    // Check if it's a git repo
+    const isRepo = await isGitRepo(gitlocation);
+    if (!isRepo) {
+      console.error(`[${projectName}] ERROR: Not a git repository: ${gitlocation}`);
+      return;
+    }
+
+    // Load .gitignore patterns
+    const ignoreInstance = loadGitignorePatterns(gitlocation);
+
+    // Create file watcher
+    const watcher = chokidar.watch(gitlocation, {
+      persistent: true,
+      ignoreInitial: true,
+      ignored: [
+        /(^|[\/\\])\../, // dot files/folders
+        /node_modules/,
+        /dist/,
+        /build/,
+        /logs/,
+        /tmp/,
+        /cache/,
+        /coverage/,
+        /\.log$/,
+        /\.tmp$/
+      ],
+      depth: 99,
+      awaitWriteFinish: {
+        stabilityThreshold: 500,
+        pollInterval: 100
+      }
+    });
+
+    watcher.on('all', (event, filePath) => {
+      this.handleFileChange(gitlocation, filePath, ignoreInstance);
+    });
+
+    watcher.on('ready', () => {
+      console.log(`[${projectName}] File watcher active`);
+    });
+
+    watcher.on('error', error => {
+      console.error(`[${projectName}] Watcher error: ${error.message}`);
+    });
+
+    this.projects.set(gitlocation, {
+      gitlink,
+      watcher,
+      commitTimeout: null,
+      ignoreInstance
+    });
+
+    console.log(`[${projectName}] Started watching for changes`);
   }
 
-  if (config.projects.length === 0) {
-    console.log('No projects configured in .env file');
-    return;
+  handleFileChange(projectPath, filePath, ignoreInstance) {
+    const projectName = path.basename(projectPath);
+    const project = this.projects.get(projectPath);
+    
+    if (!project) return;
+
+    // Check if file should be ignored
+    if (shouldIgnorePath(projectPath, filePath, ignoreInstance)) {
+      return;
+    }
+
+    // Clear existing timeout
+    if (project.commitTimeout) {
+      clearTimeout(project.commitTimeout);
+    }
+
+    // Schedule commit with debounce
+    project.commitTimeout = setTimeout(async () => {
+      project.commitTimeout = null;
+      const relativePath = path.relative(projectPath, filePath);
+      console.log(`\n[${projectName}] Change detected: ${relativePath}`);
+      await commitChanges(projectPath, this.userInfo);
+    }, this.commitDebounceMs);
   }
 
-  console.log(`Token: ${config.token.substring(0, 8)}...`);
-  console.log(`Sync interval: ${config.syncTime} minutes`);
-  console.log(`Projects to sync: ${config.projects.length}`);
+  async pushAllProjects() {
+    console.log(`\n${'='.repeat(60)}`);
+    console.log(`Pushing all projects to GitHub...`);
+    console.log(`${'='.repeat(60)}`);
 
-  // Sync each project
-  for (const project of config.projects) {
-    await syncProject(project, config.token);
+    for (const [projectPath, project] of this.projects) {
+      await pushToGitHub(projectPath, project.gitlink, this.token, this.userInfo);
+    }
+
+    console.log(`${'='.repeat(60)}`);
+    console.log('Push complete');
+    console.log(`${'='.repeat(60)}\n`);
   }
 
-  console.log(`\n${'='.repeat(60)}`);
-  console.log('All projects synced');
-  console.log(`${'='.repeat(60)}\n`);
+  setCommitDebounce(ms) {
+    this.commitDebounceMs = ms;
+  }
+
+  async close() {
+    for (const [_, project] of this.projects) {
+      if (project.commitTimeout) {
+        clearTimeout(project.commitTimeout);
+      }
+      if (project.watcher) {
+        await project.watcher.close();
+      }
+    }
+  }
 }
 
 // Main function
 async function main() {
-  console.log('=== RepoPush ===');
-  console.log('Starting sync service...\n');
+  console.log('=== RepoPush Enhanced ===');
+  console.log('Auto-commit on file changes + Timed GitHub sync\n');
 
-  // Perform initial sync
-  await performSync();
-
-  // Read sync interval from .env
   const envPath = getEnvPath();
+  
   if (!fs.existsSync(envPath)) {
     console.error(`ERROR: .env file not found at ${envPath}`);
     process.exit(1);
   }
 
+  // Read config
   const config = parseEnvFile(envPath);
-  const syncIntervalMs = (config.syncTime || 60) * 60 * 1000;
 
-  console.log(`\nScheduling syncs every ${config.syncTime} minutes`);
+  if (!config.token) {
+    console.error('ERROR: GitHub token not found in .env file');
+    process.exit(1);
+  }
+
+  if (config.projects.length === 0) {
+    console.log('No projects configured in .env file');
+    process.exit(1);
+  }
+
+  // Get user info from .env or fetch from GitHub
+  let userInfo;
+  
+  if (config.gitAuthorName && config.gitAuthorEmail) {
+    // Use credentials from .env
+    console.log('Using git credentials from .env...');
+    userInfo = {
+      name: config.gitAuthorName,
+      email: config.gitAuthorEmail,
+      login: config.gitAuthorName // Fallback to name if no login
+    };
+  } else {
+    // Fetch from GitHub API
+    console.log('Fetching GitHub user information...');
+    userInfo = await fetchGitHubUserInfo(config.token);
+    
+    if (!userInfo) {
+      console.error('ERROR: Failed to fetch GitHub user information');
+      console.error('Please add git_author_name and git_author_email to your .env file');
+      process.exit(1);
+    }
+  }
+
+  console.log(`Git Author: ${userInfo.name}`);
+  console.log(`Commit Email: ${userInfo.email}`);
+  console.log(`Projects to watch: ${config.projects.length}`);
+  console.log(`Commit debounce: ${config.commitDebounceMs}ms`);
+  console.log(`Push interval: ${config.syncTime} minutes\n`);
+
+  // Create project manager
+  const manager = new ProjectManager(config.token, userInfo);
+  manager.setCommitDebounce(config.commitDebounceMs);
+
+  // Add all projects
+  for (const project of config.projects) {
+    await manager.addProject(project.gitlink, project.gitlocation);
+  }
+
+  console.log('\n✓ All projects initialized');
+  console.log('Monitoring for file changes and will push to GitHub every', config.syncTime, 'minutes');
   console.log('Press Ctrl+C to stop\n');
 
-  // Schedule periodic syncs
+  // Commit any pending changes in all projects on startup
+  console.log('============================================================');
+  console.log('Committing any pending changes in all projects...');
+  console.log('============================================================\n');
+  
+  for (const project of config.projects) {
+    const projectPath = project.gitlocation;
+    const projectName = path.basename(projectPath);
+    
+    // Check if directory exists and is a git repo
+    if (!fs.existsSync(projectPath)) {
+      console.log(`[${projectName}] Skipping - directory doesn't exist`);
+      continue;
+    }
+    
+    const isRepo = await isGitRepo(projectPath);
+    if (!isRepo) {
+      console.log(`[${projectName}] Skipping - not a git repository`);
+      continue;
+    }
+    
+    // Commit any changes
+    const committed = await commitChanges(projectPath, userInfo);
+    if (!committed) {
+      console.log(`[${projectName}] No changes to commit`);
+    }
+  }
+
+  console.log('\n============================================================');
+  console.log('Startup commits complete - syncing to GitHub...');
+  console.log('============================================================\n');
+
+  // Schedule periodic pushes
+  const syncIntervalMs = config.syncTime * 60 * 1000;
   const intervalId = setInterval(async () => {
-    await performSync();
+    await manager.pushAllProjects();
   }, syncIntervalMs);
 
-  // Graceful shutdown
-  process.on('SIGINT', () => {
-    console.log('\n\nShutting down...');
-    clearInterval(intervalId);
-    process.exit(0);
-  });
+  // Perform initial push
+  await manager.pushAllProjects();
 
-  process.on('SIGTERM', () => {
+  // Graceful shutdown
+  const shutdown = async () => {
     console.log('\n\nShutting down...');
     clearInterval(intervalId);
+    await manager.close();
     process.exit(0);
-  });
+  };
+
+  process.on('SIGINT', shutdown);
+  process.on('SIGTERM', shutdown);
 }
 
 // Run main
@@ -518,4 +675,3 @@ main().catch(error => {
   console.error(error.stack);
   process.exit(1);
 });
-

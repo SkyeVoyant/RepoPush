@@ -6,6 +6,6 @@ services:
       ENV_FILE: /app/.env
     volumes:
       - ./.env:/app/.env:ro
-      - ${PROJECTS_PATH}:/projects
+      - /root/projects:/root/projects
     restart: unless-stopped
 
