@@ -1,4 +1,4 @@
-# RepoPush Enhanced
+# RepoPush (Open Source)
 
 A **lightweight** tool that automatically commits file changes and syncs local git repositories to GitHub using fine-grained tokens. 
 
