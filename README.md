@@ -2,7 +2,7 @@
 
 **Simple, automatic backup system for your projects to GitHub.**
 
-Monitors your projects and automatically commits every change locally, then syncs to GitHub at regular intervals. No spam, no fuss.
+Monitors your projects and automatically commits every change locally, then syncs to GitHub at regular intervals.
 
 ## What it does
 
