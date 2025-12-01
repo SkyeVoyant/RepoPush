@@ -2,14 +2,10 @@
 
 const fs = require('fs');
 const path = require('path');
-const { execFile } = require('child_process');
-const util = require('util');
-const os = require('os');
+const { spawn } = require('child_process');
 const axios = require('axios');
 const chokidar = require('chokidar');
 const ignore = require('ignore');
-
-const execFileAsync = util.promisify(execFile);
 
 // Parse .env file (reads fresh every time for push config)
 function parseEnvFile(envPath) {
@@ -79,35 +75,84 @@ function getEnvPath() {
   return process.env.ENV_FILE || path.join(__dirname, '.env');
 }
 
-// Execute git command with timeout
+// Execute git command with streaming (discards output when not needed)
 async function git(projectPath, args, options = {}) {
   const timeout = options.timeout || 300000; // 5 minutes default timeout
   const timeoutMs = timeout;
-  delete options.timeout;
+  const discardOutput = options.discardOutput !== false; // Default to discarding
+  const maxOutputSize = options.maxOutputSize || 1024; // 1KB default for commands that need output
+  
+  // Extract custom options and preserve spawn options
+  const { timeout: _, discardOutput: __, maxOutputSize: ___, env, ...spawnOptions } = options;
   
   return new Promise((resolve, reject) => {
     let resolved = false;
-    const child = execFile('git', args, {
+    let stdout = '';
+    let stderr = '';
+    let stdoutSize = 0;
+    let stderrSize = 0;
+    
+    const child = spawn('git', args, {
       cwd: projectPath,
-      maxBuffer: 50 * 1024 * 1024, // 50MB buffer
-      ...options
-    }, (error, stdout, stderr) => {
+      env: env ? { ...process.env, ...env } : process.env,
+      stdio: ['ignore', 'pipe', 'pipe'],
+      ...spawnOptions
+    });
+
+    // Discard or collect stdout
+    if (discardOutput) {
+      child.stdout.on('data', () => {
+        // Discard all output
+      });
+    } else {
+      child.stdout.on('data', (chunk) => {
+        if (stdoutSize < maxOutputSize) {
+          stdout += chunk.toString();
+          stdoutSize += chunk.length;
+        }
+      });
+    }
+
+    // Collect stderr for error messages (limited size)
+    child.stderr.on('data', (chunk) => {
+      if (stderrSize < 1024) { // Max 1KB for error messages
+        stderr += chunk.toString();
+        stderrSize += chunk.length;
+      }
+    });
+
+    child.on('error', (error) => {
+      if (resolved) return;
+      resolved = true;
+      clearTimeout(timeoutId);
+      cleanup();
+      // Error event is for process startup failures (e.g., git not found)
+      reject(error);
+    });
+
+    child.on('close', (code) => {
       if (resolved) return;
       resolved = true;
       clearTimeout(timeoutId);
       
-      if (error) {
-        const stderrMsg = (stderr || '').toString().trim();
-        const message = stderrMsg || error.message;
+      // Capture values before cleanup
+      const stdoutResult = stdout.trim();
+      const stderrResult = stderr.trim();
+      
+      cleanup();
+      
+      if (code !== 0) {
+        const message = stderrResult || `Git command failed with code ${code}`;
         reject(new Error(message));
       } else {
-        resolve({ stdout: stdout.trim(), stderr: stderr.trim() });
+        resolve({ stdout: stdoutResult, stderr: stderrResult });
       }
     });
 
     const timeoutId = setTimeout(() => {
       if (resolved) return;
       resolved = true;
+      cleanup();
       try {
         child.kill('SIGKILL');
       } catch (e) {
@@ -115,6 +160,25 @@ async function git(projectPath, args, options = {}) {
       }
       reject(new Error(`Git command timed out after ${timeoutMs}ms: git ${args.join(' ')}`));
     }, timeoutMs);
+
+    function cleanup() {
+      // Explicitly clean up streams and references
+      if (child.stdout) {
+        child.stdout.removeAllListeners();
+        child.stdout.destroy();
+      }
+      if (child.stderr) {
+        child.stderr.removeAllListeners();
+        child.stderr.destroy();
+      }
+      if (child.stdin) {
+        child.stdin.removeAllListeners();
+        child.stdin.destroy();
+      }
+      // Clear string references to help GC
+      stdout = null;
+      stderr = null;
+    }
   });
 }
 
@@ -151,7 +215,10 @@ async function isGitRepo(projectPath) {
 // Get current branch
 async function getCurrentBranch(projectPath) {
   try {
-    const { stdout } = await git(projectPath, ['rev-parse', '--abbrev-ref', 'HEAD']);
+    const { stdout } = await git(projectPath, ['rev-parse', '--abbrev-ref', 'HEAD'], {
+      discardOutput: false,
+      maxOutputSize: 256 // Branch names are short
+    });
     return stdout || 'main';
   } catch {
     return 'main';
@@ -200,7 +267,10 @@ function shouldIgnorePath(projectPath, filePath, igInstance) {
 // Check if there are uncommitted changes
 async function hasUncommittedChanges(projectPath) {
   try {
-    const { stdout } = await git(projectPath, ['status', '--porcelain']);
+    const { stdout } = await git(projectPath, ['status', '--porcelain'], {
+      discardOutput: false,
+      maxOutputSize: 1024 // Only need to check if empty
+    });
     return stdout.length > 0;
   } catch {
     return false;
