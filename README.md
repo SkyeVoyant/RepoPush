@@ -18,9 +18,11 @@ That's it. Simple, reliable backups with your GitHub identity.
 
 - Commits every detectable change locally (debounced to avoid spam)
 - Pushes to GitHub at configurable intervals (default: 60 minutes)
+- **Auto-initializes git repos** - If a project directory doesn't have `.git`, it's initialized automatically
 - Auto-creates GitHub repos if missing (requires Administration permission)
 - Uses your name and email from `.env` for commits
 - Respects `.gitignore` in each project
+- **Hot-reload configuration** - Edit `.env` and changes apply automatically (no restart needed!)
 - Lightweight and fast
 - Runs in Docker
 
@@ -80,8 +82,10 @@ gitlocation=/path/to/your/projects/another-repo
 ## How it works
 
 - Watches all configured projects for file changes
+- **Auto-initializes** git repositories if they don't exist (creates initial commit if files are present)
 - Commits changes locally after 3 seconds of inactivity (debounced)
 - Pushes all commits to GitHub every 60 minutes
+- New projects are committed and pushed immediately (no waiting for file changes)
 - Each project syncs independently
 - Force pushes when needed (local is authoritative)
 - Creates GitHub repos automatically if they don't exist
@@ -98,6 +102,11 @@ gitlocation=/path/to/your/projects/another-repo
 - Check that files aren't in `.gitignore`
 - Verify paths in `.env` are correct
 - Check logs: `docker logs RepoPush`
+
+**New project not being pushed?**
+- The project directory must exist (git will be auto-initialized if missing)
+- If the directory is empty, git will be initialized but no commit will be created until files are added
+- Check logs for initialization messages: `[project-name] Initializing git repository...`
 
 **Push failures?**
 - Verify token has **Contents: Read and write**
@@ -116,6 +125,16 @@ gitlocation=/path/to/your/projects/another-repo
 - Add **Administration: Read and write** permission to your token
 - Or manually create the repo on GitHub first
 
+## Hot-reload Configuration
+
+**No restart needed!** RepoPush automatically watches your `.env` file for changes:
+
+- **Add new projects** - Just add them to `.env` and save. They'll be added automatically.
+- **Remove projects** - Remove them from `.env` and they'll stop being watched.
+- **Update settings** - Change `sync_time`, `commit_debounce_ms`, or credentials - changes apply immediately.
+
+The app detects `.env` changes within 1 second and reloads the configuration automatically. You'll see `[Config] .env file changed, reloading configuration...` in the logs when it happens.
+
 ## Docker commands
 
 ```bash
@@ -128,7 +147,7 @@ docker compose down
 # View logs
 docker logs RepoPush -f
 
-# Restart (e.g., after editing .env)
+# Restart (optional - hot-reload means restart not needed for .env changes)
 docker compose restart
 ```
 

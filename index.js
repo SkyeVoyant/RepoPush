@@ -7,7 +7,7 @@ const axios = require('axios');
 const chokidar = require('chokidar');
 const ignore = require('ignore');
 
-// Parse .env file (reads fresh every time for push config)
+// Parse .env file and extract configuration
 function parseEnvFile(envPath) {
   const content = fs.readFileSync(envPath, 'utf8');
   const config = {
@@ -22,6 +22,7 @@ function parseEnvFile(envPath) {
   const lines = content.split('\n');
   let currentProject = null;
 
+  // Parse each line of the .env file
   for (const line of lines) {
     const trimmed = line.trim();
     
@@ -30,13 +31,14 @@ function parseEnvFile(envPath) {
       continue;
     }
 
-    // Parse key = value
+    // Parse key = value format
     const match = trimmed.match(/^([^=]+?)\s*=\s*(.+)$/);
     if (!match) continue;
 
     const key = match[1].trim();
     const value = match[2].trim();
 
+    // Map .env keys to config properties
     if (key === 'token') {
       config.token = value;
     } else if (key === 'git_author_name') {
@@ -48,6 +50,7 @@ function parseEnvFile(envPath) {
     } else if (key === 'commit_debounce_ms') {
       config.commitDebounceMs = parseInt(value, 10) || 3000;
     } else if (key === 'gitlink') {
+      // Start a new project entry
       if (currentProject) {
         // Finish previous project if it has both fields
         if (currentProject.gitlink && currentProject.gitlocation) {
@@ -56,6 +59,7 @@ function parseEnvFile(envPath) {
       }
       currentProject = { gitlink: value, gitlocation: null };
     } else if (key === 'gitlocation') {
+      // Complete the current project entry
       if (currentProject) {
         currentProject.gitlocation = value;
       }
@@ -75,7 +79,7 @@ function getEnvPath() {
   return process.env.ENV_FILE || path.join(__dirname, '.env');
 }
 
-// Execute git command with streaming (discards output when not needed)
+// Execute git command with timeout and output management
 async function git(projectPath, args, options = {}) {
   const timeout = options.timeout || 300000; // 5 minutes default timeout
   const timeoutMs = timeout;
@@ -92,6 +96,7 @@ async function git(projectPath, args, options = {}) {
     let stdoutSize = 0;
     let stderrSize = 0;
     
+    // Spawn git process
     const child = spawn('git', args, {
       cwd: projectPath,
       env: env ? { ...process.env, ...env } : process.env,
@@ -99,7 +104,7 @@ async function git(projectPath, args, options = {}) {
       ...spawnOptions
     });
 
-    // Discard or collect stdout
+    // Handle stdout - either discard or collect with size limit
     if (discardOutput) {
       child.stdout.on('data', () => {
         // Discard all output
@@ -121,15 +126,16 @@ async function git(projectPath, args, options = {}) {
       }
     });
 
+    // Handle process startup failures (e.g., git not found)
     child.on('error', (error) => {
       if (resolved) return;
       resolved = true;
       clearTimeout(timeoutId);
       cleanup();
-      // Error event is for process startup failures (e.g., git not found)
       reject(error);
     });
 
+    // Handle process completion
     child.on('close', (code) => {
       if (resolved) return;
       resolved = true;
@@ -149,6 +155,7 @@ async function git(projectPath, args, options = {}) {
       }
     });
 
+    // Set timeout to kill process if it takes too long
     const timeoutId = setTimeout(() => {
       if (resolved) return;
       resolved = true;
@@ -156,13 +163,13 @@ async function git(projectPath, args, options = {}) {
       try {
         child.kill('SIGKILL');
       } catch (e) {
-        // Ignore
+        // Ignore kill errors
       }
       reject(new Error(`Git command timed out after ${timeoutMs}ms: git ${args.join(' ')}`));
     }, timeoutMs);
 
+    // Clean up streams and references
     function cleanup() {
-      // Explicitly clean up streams and references
       if (child.stdout) {
         child.stdout.removeAllListeners();
         child.stdout.destroy();
@@ -182,7 +189,7 @@ async function git(projectPath, args, options = {}) {
   });
 }
 
-// Fetch GitHub user info
+// Fetch GitHub user info from API
 async function fetchGitHubUserInfo(token) {
   try {
     const response = await axios.get('https://api.github.com/user', {
@@ -208,6 +215,43 @@ async function isGitRepo(projectPath) {
     await git(projectPath, ['rev-parse', '--git-dir']);
     return true;
   } catch {
+    return false;
+  }
+}
+
+// Initialize git repository if it doesn't exist
+async function initializeGitRepo(projectPath, userInfo) {
+  const projectName = path.basename(projectPath);
+  
+  try {
+    // Check if already a git repo
+    const isRepo = await isGitRepo(projectPath);
+    if (isRepo) {
+      return true;
+    }
+
+    console.log(`[${projectName}] Initializing git repository...`);
+    
+    // Initialize git repo
+    await git(projectPath, ['init']);
+    
+    // Set git config
+    await setGitConfig(projectPath, userInfo);
+    
+    // Create initial commit if there are files
+    const hasChanges = await hasUncommittedChanges(projectPath);
+    if (hasChanges) {
+      await git(projectPath, ['add', '-A']);
+      const timestamp = new Date().toISOString();
+      await git(projectPath, ['commit', '-m', `Initial commit ${timestamp}`]);
+      console.log(`[${projectName}] ✓ Initialized and committed`);
+    } else {
+      console.log(`[${projectName}] ✓ Initialized (no files to commit)`);
+    }
+    
+    return true;
+  } catch (error) {
+    console.error(`[${projectName}] Failed to initialize git repository: ${error.message}`);
     return false;
   }
 }
@@ -277,19 +321,36 @@ async function hasUncommittedChanges(projectPath) {
   }
 }
 
-// Set remote URL with token
+// Check if repository has any commits
+async function hasCommits(projectPath) {
+  try {
+    await git(projectPath, ['rev-parse', '--verify', 'HEAD'], {
+      discardOutput: true
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// Set or update remote URL with authentication token
 async function setRemote(projectPath, gitlink, token) {
   let remoteUrl = gitlink;
+  
+  // Convert URL to authenticated format
   if (remoteUrl.startsWith('https://')) {
+    // Remove existing auth if present, then add token
     remoteUrl = remoteUrl.replace(/https:\/\/[^@]+@/, 'https://');
     remoteUrl = remoteUrl.replace('https://', `https://x-access-token:${token}@`);
   } else if (remoteUrl.startsWith('git@')) {
+    // Convert SSH format to HTTPS with token
     remoteUrl = remoteUrl
       .replace('git@github.com:', 'https://github.com/')
       .replace('.git', '')
       .replace('https://', `https://x-access-token:${token}@`) + '.git';
   }
 
+  // Check if remote already exists
   let remoteExists = false;
   try {
     await git(projectPath, ['remote', 'get-url', 'github']);
@@ -298,6 +359,7 @@ async function setRemote(projectPath, gitlink, token) {
     remoteExists = false;
   }
 
+  // Update or add remote
   if (remoteExists) {
     await git(projectPath, ['remote', 'set-url', 'github', remoteUrl]);
   } else {
@@ -348,11 +410,29 @@ async function commitChanges(projectPath, userInfo) {
 
 // Extract repo owner and name from GitHub URL
 function parseGitHubUrl(gitlink) {
-  // Handle https://github.com/owner/repo or https://github.com/owner/repo.git
-  const match = gitlink.match(/github\.com[\/:]([^\/]+)\/([^\/\.]+)/);
-  if (match) {
-    return { owner: match[1], repo: match[2] };
+  // Handle various GitHub URL formats:
+  // - https://github.com/owner/repo
+  // - https://github.com/owner/repo.git
+  // - git@github.com:owner/repo.git
+  // - https://x-access-token:token@github.com/owner/repo.git
+  let cleaned = gitlink.trim();
+  
+  // Remove .git suffix if present
+  cleaned = cleaned.replace(/\.git$/, '');
+  
+  // Extract owner/repo from URL
+  const patterns = [
+    /github\.com[\/:]([^\/]+)\/([^\/\?]+)/,  // Standard format
+    /github\.com[\/:]([^\/]+)\/([^\/]+)$/   // Fallback
+  ];
+  
+  for (const pattern of patterns) {
+    const match = cleaned.match(pattern);
+    if (match && match[1] && match[2]) {
+      return { owner: match[1], repo: match[2] };
+    }
   }
+  
   return null;
 }
 
@@ -450,6 +530,13 @@ async function pushToGitHub(projectPath, gitlink, token, userInfo) {
       return false;
     }
 
+    // Check if repo has any commits before pushing
+    const hasCommitsInRepo = await hasCommits(projectPath);
+    if (!hasCommitsInRepo) {
+      console.log(`[${projectName}] Skipping push - no commits in repository yet`);
+      return false;
+    }
+
     // Set remote
     await setRemote(projectPath, gitlink, token);
 
@@ -491,7 +578,7 @@ async function pushToGitHub(projectPath, gitlink, token, userInfo) {
   }
 }
 
-// Project state manager
+// Manages all projects being watched and synced
 class ProjectManager {
   constructor(token, userInfo) {
     this.token = token;
@@ -500,7 +587,8 @@ class ProjectManager {
     this.commitDebounceMs = 3000;
   }
 
-  async addProject(gitlink, gitlocation) {
+  // Add a project to watch list, initialize git if needed, and optionally commit/push
+  async addProject(gitlink, gitlocation, shouldCommitAndPush = true) {
     const projectName = path.basename(gitlocation);
 
     // Check if directory exists
@@ -509,11 +597,14 @@ class ProjectManager {
       return;
     }
 
-    // Check if it's a git repo
-    const isRepo = await isGitRepo(gitlocation);
-    if (!isRepo) {
-      console.error(`[${projectName}] ERROR: Not a git repository: ${gitlocation}`);
-      return;
+    // Initialize git repo if it doesn't exist
+    const wasNewRepo = !(await isGitRepo(gitlocation));
+    if (wasNewRepo) {
+      const initialized = await initializeGitRepo(gitlocation, this.userInfo);
+      if (!initialized) {
+        console.error(`[${projectName}] ERROR: Failed to initialize git repository`);
+        return;
+      }
     }
 
     // Load .gitignore patterns
@@ -562,8 +653,19 @@ class ProjectManager {
     });
 
     console.log(`[${projectName}] Started watching for changes`);
+
+    // If this is a new project or was just initialized, commit and push immediately
+    if (shouldCommitAndPush) {
+      // Commit any changes (including initial commit if repo was just created)
+      const committed = await commitChanges(gitlocation, this.userInfo);
+      if (committed || wasNewRepo) {
+        // Push immediately for new repos or if there were changes
+        await pushToGitHub(gitlocation, gitlink, this.token, this.userInfo);
+      }
+    }
   }
 
+  // Handle file change event with debouncing to avoid too many commits
   handleFileChange(projectPath, filePath, ignoreInstance) {
     const projectName = path.basename(projectPath);
     const project = this.projects.get(projectPath);
@@ -575,12 +677,12 @@ class ProjectManager {
       return;
     }
 
-    // Clear existing timeout
+    // Clear existing timeout to reset debounce timer
     if (project.commitTimeout) {
       clearTimeout(project.commitTimeout);
     }
 
-    // Schedule commit with debounce
+    // Schedule commit with debounce delay
     project.commitTimeout = setTimeout(async () => {
       project.commitTimeout = null;
       const relativePath = path.relative(projectPath, filePath);
@@ -589,6 +691,7 @@ class ProjectManager {
     }, this.commitDebounceMs);
   }
 
+  // Push all projects to GitHub (called on interval)
   async pushAllProjects() {
     console.log(`\n${'='.repeat(60)}`);
     console.log(`Pushing all projects to GitHub...`);
@@ -603,10 +706,72 @@ class ProjectManager {
     console.log(`${'='.repeat(60)}\n`);
   }
 
+  // Update commit debounce delay
   setCommitDebounce(ms) {
     this.commitDebounceMs = ms;
   }
 
+  // Remove project from watch list and cleanup resources
+  async removeProject(gitlocation) {
+    const project = this.projects.get(gitlocation);
+    if (!project) return;
+
+    const projectName = path.basename(gitlocation);
+    console.log(`[${projectName}] Removing project from watch list`);
+
+    if (project.commitTimeout) {
+      clearTimeout(project.commitTimeout);
+    }
+    if (project.watcher) {
+      await project.watcher.close();
+    }
+
+    this.projects.delete(gitlocation);
+  }
+
+  // Reload projects from new config (hot-reload support)
+  async reloadProjects(newProjects, newToken, newUserInfo, newCommitDebounceMs, newSyncTime) {
+    // Update token and user info if changed
+    if (newToken !== this.token) {
+      this.token = newToken;
+    }
+    if (newUserInfo && (newUserInfo.name !== this.userInfo.name || newUserInfo.email !== this.userInfo.email)) {
+      this.userInfo = newUserInfo;
+    }
+    if (newCommitDebounceMs !== this.commitDebounceMs) {
+      this.setCommitDebounce(newCommitDebounceMs);
+    }
+
+    // Create a map of new projects by gitlocation for easy lookup
+    const newProjectsMap = new Map();
+    for (const project of newProjects) {
+      newProjectsMap.set(project.gitlocation, project);
+    }
+
+    // Remove projects that are no longer in the config
+    const projectsToRemove = [];
+    for (const [gitlocation, _] of this.projects) {
+      if (!newProjectsMap.has(gitlocation)) {
+        projectsToRemove.push(gitlocation);
+      }
+    }
+
+    for (const gitlocation of projectsToRemove) {
+      await this.removeProject(gitlocation);
+    }
+
+    // Add new projects that weren't there before
+    for (const project of newProjects) {
+      if (!this.projects.has(project.gitlocation)) {
+        // Commit and push immediately when adding via hot-reload
+        await this.addProject(project.gitlink, project.gitlocation, true);
+      }
+    }
+
+    return newSyncTime;
+  }
+
+  // Cleanup all watchers and timeouts on shutdown
   async close() {
     for (const [_, project] of this.projects) {
       if (project.commitTimeout) {
@@ -619,11 +784,12 @@ class ProjectManager {
   }
 }
 
-// Main function
+// Main entry point - initializes and starts the application
 async function main() {
   console.log('=== RepoPush Enhanced ===');
   console.log('Auto-commit on file changes + Timed GitHub sync\n');
 
+  // Get .env file path
   const envPath = getEnvPath();
   
   if (!fs.existsSync(envPath)) {
@@ -631,7 +797,7 @@ async function main() {
     process.exit(1);
   }
 
-  // Read config
+  // Parse configuration from .env file
   const config = parseEnvFile(envPath);
 
   if (!config.token) {
@@ -647,24 +813,26 @@ async function main() {
   // Get user info from .env or fetch from GitHub
   let userInfo;
   
+  // Always fetch login from GitHub API (needed for repo creation logic)
+  console.log('Fetching GitHub user information...');
+  const githubUserInfo = await fetchGitHubUserInfo(config.token);
+  
+  if (!githubUserInfo) {
+    console.error('ERROR: Failed to fetch GitHub user information');
+    process.exit(1);
+  }
+
   if (config.gitAuthorName && config.gitAuthorEmail) {
-    // Use credentials from .env
+    // Use credentials from .env but keep login from GitHub API
     console.log('Using git credentials from .env...');
     userInfo = {
       name: config.gitAuthorName,
       email: config.gitAuthorEmail,
-      login: config.gitAuthorName // Fallback to name if no login
+      login: githubUserInfo.login // Use actual login from GitHub API
     };
   } else {
-    // Fetch from GitHub API
-    console.log('Fetching GitHub user information...');
-    userInfo = await fetchGitHubUserInfo(config.token);
-    
-    if (!userInfo) {
-      console.error('ERROR: Failed to fetch GitHub user information');
-      console.error('Please add git_author_name and git_author_email to your .env file');
-      process.exit(1);
-    }
+    // Use everything from GitHub API
+    userInfo = githubUserInfo;
   }
 
   console.log(`Git Author: ${userInfo.name}`);
@@ -677,52 +845,94 @@ async function main() {
   const manager = new ProjectManager(config.token, userInfo);
   manager.setCommitDebounce(config.commitDebounceMs);
 
-  // Add all projects
+  // Add all projects (will commit and push immediately if new)
   for (const project of config.projects) {
-    await manager.addProject(project.gitlink, project.gitlocation);
+    await manager.addProject(project.gitlink, project.gitlocation, true);
   }
 
   console.log('\n✓ All projects initialized');
   console.log('Monitoring for file changes and will push to GitHub every', config.syncTime, 'minutes');
   console.log('Press Ctrl+C to stop\n');
 
-  // Commit any pending changes in all projects on startup
-  console.log('============================================================');
-  console.log('Committing any pending changes in all projects...');
-  console.log('============================================================\n');
-  
-  for (const project of config.projects) {
-    const projectPath = project.gitlocation;
-    const projectName = path.basename(projectPath);
-    
-    // Check if directory exists and is a git repo
-    if (!fs.existsSync(projectPath)) {
-      console.log(`[${projectName}] Skipping - directory doesn't exist`);
-      continue;
-    }
-    
-    const isRepo = await isGitRepo(projectPath);
-    if (!isRepo) {
-      console.log(`[${projectName}] Skipping - not a git repository`);
-      continue;
-    }
-    
-    // Commit any changes
-    const committed = await commitChanges(projectPath, userInfo);
-    if (!committed) {
-      console.log(`[${projectName}] No changes to commit`);
-    }
-  }
-
-  console.log('\n============================================================');
-  console.log('Startup commits complete - syncing to GitHub...');
-  console.log('============================================================\n');
-
-  // Schedule periodic pushes
-  const syncIntervalMs = config.syncTime * 60 * 1000;
-  const intervalId = setInterval(async () => {
+  // Schedule periodic pushes to GitHub
+  let syncIntervalMs = config.syncTime * 60 * 1000;
+  let intervalId = setInterval(async () => {
     await manager.pushAllProjects();
   }, syncIntervalMs);
+
+  // Watch .env file for configuration changes (hot-reload)
+  const envWatcher = chokidar.watch(envPath, {
+    persistent: true,
+    ignoreInitial: true,
+    awaitWriteFinish: {
+      stabilityThreshold: 1000,
+      pollInterval: 100
+    }
+  });
+
+  // Handle .env file changes
+  envWatcher.on('change', async () => {
+    console.log('\n[Config] .env file changed, reloading configuration...');
+    
+    try {
+      // Re-parse .env file
+      const newConfig = parseEnvFile(envPath);
+
+      if (!newConfig.token) {
+        console.error('[Config] ERROR: GitHub token not found in .env file, keeping current config');
+        return;
+      }
+
+      // Get user info (reuse existing logic)
+      const githubUserInfo = await fetchGitHubUserInfo(newConfig.token);
+      if (!githubUserInfo) {
+        console.error('[Config] ERROR: Failed to fetch GitHub user information, keeping current config');
+        return;
+      }
+
+      let newUserInfo;
+      if (newConfig.gitAuthorName && newConfig.gitAuthorEmail) {
+        newUserInfo = {
+          name: newConfig.gitAuthorName,
+          email: newConfig.gitAuthorEmail,
+          login: githubUserInfo.login // Use actual login from GitHub API
+        };
+      } else {
+        newUserInfo = githubUserInfo;
+      }
+
+      // Reload projects
+      const newSyncTime = await manager.reloadProjects(
+        newConfig.projects,
+        newConfig.token,
+        newUserInfo,
+        newConfig.commitDebounceMs,
+        newConfig.syncTime
+      );
+
+      // Update sync interval if it changed
+      if (newSyncTime !== config.syncTime) {
+        console.log(`[Config] Sync interval changed from ${config.syncTime} to ${newSyncTime} minutes`);
+        clearInterval(intervalId);
+        syncIntervalMs = newSyncTime * 60 * 1000;
+        intervalId = setInterval(async () => {
+          await manager.pushAllProjects();
+        }, syncIntervalMs);
+        config.syncTime = newSyncTime;
+      }
+
+      console.log(`[Config] Configuration reloaded: ${newConfig.projects.length} project(s) configured`);
+      console.log(`[Config] Commit debounce: ${newConfig.commitDebounceMs}ms`);
+      console.log(`[Config] Push interval: ${newConfig.syncTime} minutes\n`);
+    } catch (error) {
+      console.error(`[Config] ERROR: Failed to reload configuration: ${error.message}`);
+      console.error('[Config] Keeping current configuration\n');
+    }
+  });
+
+  envWatcher.on('error', error => {
+    console.error(`[Config] Watcher error: ${error.message}`);
+  });
 
   // Perform initial push
   await manager.pushAllProjects();
@@ -731,6 +941,9 @@ async function main() {
   const shutdown = async () => {
     console.log('\n\nShutting down...');
     clearInterval(intervalId);
+    if (envWatcher) {
+      await envWatcher.close();
+    }
     await manager.close();
     process.exit(0);
   };
